@@ -31,6 +31,7 @@ def get_connection():
         user=DB_USER,
         password=DB_PASSWORD,
         dsn=DB_DSN,
+        config_dir=os.getenv("DB_WALLET_DIR"),
         wallet_location=os.getenv("DB_WALLET_DIR"),
         wallet_password=os.getenv("DB_WALLET_PASSWORD")
     )

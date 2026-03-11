@@ -16,3 +16,10 @@ ojdbc.properties
 sqlnet.ora
 tnsnames.ora
 truststore.jks
+wallet/
+wallet/
+Wallet_D2W1N9HOJWEQJDR2/
+*.sso
+*.pem
+*.p12
+*.jks
