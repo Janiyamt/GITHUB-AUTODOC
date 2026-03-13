@@ -22,6 +22,9 @@ GITHUB_WEBHOOK_SECRET = os.getenv("GITHUB_WEBHOOK_SECRET")
 # ── OCI ────────────────────────────────────
 OCI_COMPARTMENT_ID = os.getenv("OCI_COMPARTMENT_ID")
 OCI_REGION         = os.getenv("OCI_REGION")
+OCI_VAULT_ID       = os.getenv("OCI_VAULT_ID")
+OCI_VAULT_KEY_ID   = os.getenv("OCI_VAULT_KEY_ID")
+
 
 # ── Validate all required values are set ───
 def validate():

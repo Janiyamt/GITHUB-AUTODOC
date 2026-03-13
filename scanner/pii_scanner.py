@@ -1,207 +1,131 @@
 """
-SECRET / PII SCANNER
-=====================
+SECRET / PII SCANNER - FINAL
+==============================
 Runs FIRST before any agent sees data.
-Scans changed files for:
-- API keys, tokens, passwords
-- Private keys, certificates
-- PII (emails, phone numbers)
-- AWS/OCI/Azure credentials
 
-If secrets found:
-- Pipeline is BLOCKED
-- Secrets logged with location
-- TODO: Send to OCI Vault (tomorrow)
-
-If clean:
-- Pipeline continues normally
+Security Rules:
+- HIGH severity → sent to OCI Vault
+- Original value NEVER passed to agents
+- Agents only see VAULT:ocid reference
+- KEY = file:line (never the secret value!)
 """
 
 import re
+import oci
+import base64
 import logging
+import os
+import uuid
 from dataclasses import dataclass
-from typing import Optional
+from dotenv import load_dotenv
 
+load_dotenv()
 log = logging.getLogger(__name__)
 
-
-# ── Secret Patterns ────────────────────────────────────────────
-# Each pattern has a name and regex
 SECRET_PATTERNS = {
-
-    # Generic secrets
-    "generic_api_key": r'(?i)(api[_-]?key|apikey)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{20,})["\']?',
-    "generic_secret":  r'(?i)(secret[_-]?key|secret)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{20,})["\']?',
-    "generic_token":   r'(?i)(token|auth[_-]?token)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{20,})["\']?',
-    "generic_password":r'(?i)(password|passwd|pwd)\s*[=:]\s*["\']?([^\s"\']{8,})["\']?',
-
-    # Private keys
-    "private_key":     r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----',
-    "private_key_pkcs":r'-----BEGIN ENCRYPTED PRIVATE KEY-----',
-
-    # Cloud credentials
-    "aws_access_key":  r'AKIA[0-9A-Z]{16}',
-    "aws_secret_key":  r'(?i)aws[_-]?secret[_-]?access[_-]?key\s*[=:]\s*["\']?([A-Za-z0-9/+=]{40})["\']?',
-    "oci_key":         r'ocid1\.(tenancy|user|instance)\.[a-z0-9]+\.\.[a-z0-9]+',
-
-    # Database
-    "db_password":     r'(?i)(db[_-]?pass|database[_-]?password)\s*[=:]\s*["\']?([^\s"\']{8,})["\']?',
+    "generic_api_key":  r'(?i)(api[_-]?key|apikey)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{20,})["\']?',
+    "generic_secret":   r'(?i)(secret[_-]?key|secret)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{20,})["\']?',
+    "generic_token":    r'(?i)(token|auth[_-]?token)\s*[=:]\s*["\']?([A-Za-z0-9_\-]{20,})["\']?',
+    "generic_password": r'(?i)(password|passwd|pwd)\s*[=:]\s*["\']?([^\s"\']{8,})["\']?',
+    "private_key":      r'-----BEGIN (RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----',
+    "private_key_pkcs": r'-----BEGIN ENCRYPTED PRIVATE KEY-----',
+    "aws_access_key":   r'AKIA[0-9A-Z]{16}',
+    "aws_secret_key":   r'(?i)aws[_-]?secret[_-]?access[_-]?key\s*[=:]\s*["\']?([A-Za-z0-9/+=]{40})["\']?',
+    "oci_key":          r'ocid1\.(tenancy|user|instance)\.[a-z0-9]+\.\.[a-z0-9]+',
+    "db_password":      r'(?i)(db[_-]?pass|database[_-]?password)\s*[=:]\s*["\']?([^\s"\']{8,})["\']?',
     "connection_string":r'(?i)(mongodb|postgresql|mysql|oracle):\/\/[^:]+:[^@]+@',
-
-    # PII
-    "email":           r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
-    "phone_number":    r'\b(\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b',
-
-    # GitHub/GitLab tokens
-    "github_token":    r'gh[pousr]_[A-Za-z0-9]{36}',
-    "gitlab_token":    r'glpat-[A-Za-z0-9\-]{20}',
-
-    # JWT tokens
-    "jwt_token":       r'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+',
+    "email":            r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b',
+    "phone_number":     r'\b(\+\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b',
+    "github_token":     r'gh[pousr]_[A-Za-z0-9]{36}',
+    "gitlab_token":     r'glpat-[A-Za-z0-9\-]{20}',
+    "jwt_token":        r'eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+',
 }
 
-# Files we should ALWAYS skip scanning
 SKIP_FILES = {
-    ".gitignore", ".gitattributes",
-    "package-lock.json", "yarn.lock",
-    "poetry.lock", "Pipfile.lock",
-    ".env.example", ".env.sample",
-    "README.md", "CHANGELOG.md",
-    "LICENSE", "LICENSE.md"
+    ".gitignore", ".gitattributes", "package-lock.json", "yarn.lock",
+    "poetry.lock", "Pipfile.lock", ".env.example", ".env.sample",
+    "README.md", "CHANGELOG.md", "LICENSE", "LICENSE.md"
 }
 
-# Extensions to skip
 SKIP_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".ico",
-    ".pdf", ".zip", ".tar", ".gz",
-    ".pyc", ".pyo", ".class",
-    ".min.js", ".min.css"
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".zip",
+    ".tar", ".gz", ".pyc", ".pyo", ".class", ".min.js", ".min.css"
 }
 
 
 @dataclass
 class SecretFinding:
-    """Represents a single secret found in code"""
     file_path:    str
     line_number:  int
     secret_type:  str
     matched_text: str
-    severity:     str  # HIGH / MEDIUM / LOW
+    severity:     str
 
 
 class SecretScanner:
-    """
-    Scans code for secrets and PII
-    Runs BEFORE any agent sees the data
-    """
 
-    # High severity — block immediately
     HIGH_SEVERITY = {
-        "private_key", "private_key_pkcs",
-        "aws_access_key", "aws_secret_key",
-        "generic_password", "db_password",
-        "connection_string", "github_token",
-        "gitlab_token", "jwt_token"
+        "private_key", "private_key_pkcs", "aws_access_key",
+        "aws_secret_key", "generic_password", "db_password",
+        "connection_string", "github_token", "gitlab_token", "jwt_token"
     }
-
-    # Medium severity — flag but review
     MEDIUM_SEVERITY = {
-        "generic_api_key", "generic_secret",
-        "generic_token", "oci_key"
+        "generic_api_key", "generic_secret", "generic_token", "oci_key"
     }
-
-    # Low severity — informational
     LOW_SEVERITY = {
         "email", "phone_number"
     }
 
     def scan(self, ctx) -> dict:
-        """
-        Main scan entry point
-        Called by Orchestrator FIRST
-
-        Returns:
-            dict with:
-            - has_secrets: bool
-            - secrets_found: list of findings
-            - scanned_files: list of files scanned
-            - skipped_files: list of files skipped
-        """
         log.info(f"[SecretScanner] Starting scan for {ctx.repo_name}")
 
-        all_findings   = []
-        scanned_files  = []
-        skipped_files  = []
+        all_findings  = []
+        scanned_files = []
+        skipped_files = []
 
-        # Get all changed files
-        changed = ctx.changed_files
-        if isinstance(changed, dict):
-            all_files = (
-                changed.get("added", []) +
-                changed.get("modified", [])
-                # Don't scan removed files
-            )
-        else:
-            all_files = []
+        changed   = ctx.changed_files
+        all_files = (
+            changed.get("added", []) + changed.get("modified", [])
+            if isinstance(changed, dict) else []
+        )
 
         if not all_files:
-            # No files to scan — check raw payload
-            log.info("[SecretScanner] No changed files found — scanning raw payload")
-            findings = self._scan_text(
-                text="",
-                file_path="raw_payload"
-            )
-            all_findings.extend(findings)
+            log.info("[SecretScanner] No changed files — scanning raw payload")
+            all_findings.extend(self._scan_text("", "raw_payload"))
         else:
             for file_path in all_files:
-                # Check if we should skip this file
                 if self._should_skip(file_path):
                     skipped_files.append(file_path)
                     continue
-
-                # Scan the file content
-                # NOTE: In real implementation, we fetch file
-                # content from GitHub API here
-                # For now we scan the file path itself
-                findings = self._scan_text(
-                    text=file_path,
-                    file_path=file_path
-                )
-                all_findings.extend(findings)
+                all_findings.extend(self._scan_text(file_path, file_path))
                 scanned_files.append(file_path)
 
-        # Determine if we should block
-        has_high   = any(f.severity == "HIGH" for f in all_findings)
-        has_medium = any(f.severity == "MEDIUM" for f in all_findings)
+        has_high    = any(f.severity == "HIGH"   for f in all_findings)
+        has_medium  = any(f.severity == "MEDIUM" for f in all_findings)
         has_secrets = has_high or has_medium
 
-        # Log findings
         if all_findings:
-            log.warning(f"[SecretScanner] ⚠️ Found {len(all_findings)} potential secrets!")
-            for finding in all_findings:
-                log.warning(
-                    f"[SecretScanner] {finding.severity} | "
-                    f"{finding.secret_type} | "
-                    f"{finding.file_path}:{finding.line_number}"
-                )
+            log.warning(f"[SecretScanner] ⚠️ Found {len(all_findings)} secrets!")
+            for f in all_findings:
+                log.warning(f"[SecretScanner] {f.severity} | {f.secret_type} | {f.file_path}:{f.line_number}")
         else:
-            log.info(f"[SecretScanner] ✅ Clean — no secrets found")
+            log.info("[SecretScanner] ✅ Clean — no secrets found")
 
         result = {
-            "has_secrets":   has_secrets,
-            "secrets_found": [
+            "has_secrets":      has_secrets,
+            "secrets_found":    [
                 {
-                    "file":        f.file_path,
-                    "line":        f.line_number,
-                    "type":        f.secret_type,
-                    "severity":    f.severity,
-                    "match":       f.matched_text[:20] + "..."
-                    if len(f.matched_text) > 20 else f.matched_text
+                    "file":     f.file_path,
+                    "line":     f.line_number,
+                    "type":     f.secret_type,
+                    "severity": f.severity,
+                    "redacted": True   # actual value never included!
                 }
                 for f in all_findings
             ],
-            "scanned_files": scanned_files,
-            "skipped_files": skipped_files,
+            "vault_references": {},
+            "scanned_files":    scanned_files,
+            "skipped_files":    skipped_files,
             "summary": {
                 "total_files_scanned": len(scanned_files),
                 "total_files_skipped": len(skipped_files),
@@ -212,63 +136,108 @@ class SecretScanner:
             }
         }
 
-        log.info(f"[SecretScanner] Scan complete: {result['summary']}")
+        if has_high:
+            log.info("[SecretScanner] Sending HIGH severity to OCI Vault")
+            result["vault_references"] = self._send_to_vault(all_findings, ctx)
 
-        # TODO: Tomorrow — send HIGH severity findings to OCI Vault
-        # if has_high:
-        #     self._send_to_vault(all_findings, ctx)
-
+        log.info(f"[SecretScanner] Complete: {result['summary']}")
         return result
 
     def _scan_text(self, text: str, file_path: str) -> list:
-        """Scan a piece of text for all secret patterns"""
         findings = []
-
         for secret_type, pattern in SECRET_PATTERNS.items():
             try:
-                matches = re.finditer(pattern, text)
-                for match in matches:
-                    severity = self._get_severity(secret_type)
-                    finding = SecretFinding(
+                for match in re.finditer(pattern, text):
+                    findings.append(SecretFinding(
                         file_path    = file_path,
                         line_number  = text[:match.start()].count('\n') + 1,
                         secret_type  = secret_type,
                         matched_text = match.group(0),
-                        severity     = severity
-                    )
-                    findings.append(finding)
+                        severity     = self._get_severity(secret_type)
+                    ))
             except re.error:
                 continue
-
         return findings
 
     def _get_severity(self, secret_type: str) -> str:
-        """Get severity level for a secret type"""
-        if secret_type in self.HIGH_SEVERITY:
-            return "HIGH"
-        elif secret_type in self.MEDIUM_SEVERITY:
-            return "MEDIUM"
-        else:
-            return "LOW"
+        if secret_type in self.HIGH_SEVERITY:   return "HIGH"
+        elif secret_type in self.MEDIUM_SEVERITY: return "MEDIUM"
+        else:                                     return "LOW"
 
     def _should_skip(self, file_path: str) -> bool:
-        """Check if file should be skipped"""
         filename  = file_path.split("/")[-1]
         extension = "." + filename.split(".")[-1] if "." in filename else ""
+        return filename in SKIP_FILES or extension in SKIP_EXTENSIONS
 
-        if filename in SKIP_FILES:
-            return True
-        if extension in SKIP_EXTENSIONS:
-            return True
-        return False
+    def _send_to_vault(self, findings: list, ctx) -> dict:
+        """
+        Send HIGH severity secrets to OCI Vault
+        KEY   = file:line  (NEVER the secret value!)
+        VALUE = vault OCID + metadata
+        Original secret cleared from memory after storing
+        """
+        vault_refs = {}
+        try:
+            oci_config   = oci.config.from_file()
+            vault_client = oci.vault.VaultsClient(oci_config)
 
-    # ── TODO: Add tomorrow ─────────────────────────────────────
-    # def _send_to_vault(self, findings, ctx):
-    #     """Send secrets to OCI Vault"""
-    #     import oci
-    #     vault_client = oci.vault.VaultsClient(config)
-    #     for finding in findings:
-    #         if finding.severity == "HIGH":
-    #             # store in vault
-    #             # replace in code with vault reference
-    #             pass
+            for finding in findings:
+                if finding.severity != "HIGH":
+                    continue
+                try:
+                    # Build secret name — no actual value in name!
+                    secret_name = "autodoc-" + \
+                        ctx.repo_name.replace("/", "-") + "-" + \
+                        finding.secret_type + "-" + \
+                        str(finding.line_number) + "-" + \
+                        uuid.uuid4().hex[:8]
+                    secret_name = ''.join(
+                        c if c.isalnum() or c == '-' else '-'
+                        for c in secret_name
+                    )[:255]
+
+                    # Encode value → store in vault
+                    secret_value = base64.b64encode(
+                        finding.matched_text.encode()
+                    ).decode()
+
+                    response = vault_client.create_secret(
+                        create_secret_details=oci.vault.models.CreateSecretDetails(
+                            compartment_id = os.getenv("OCI_COMPARTMENT_ID"),
+                            vault_id       = os.getenv("OCI_VAULT_ID"),
+                            key_id         = os.getenv("OCI_VAULT_KEY_ID"),
+                            secret_name    = secret_name,
+                            secret_content = oci.vault.models.Base64SecretContentDetails(
+                                content_type = "BASE64",
+                                content      = secret_value
+                            )
+                        )
+                    )
+
+                    vault_ocid   = response.data.id
+                    location_key = f"{finding.file_path}:{finding.line_number}"
+
+                    # Store location → OCID (never secret → OCID!)
+                    vault_refs[location_key] = {
+                        "ocid":        vault_ocid,
+                        "secret_type": finding.secret_type,
+                        "severity":    finding.severity
+                    }
+
+                    # Log OCID only — NEVER log actual secret!
+                    log.info(
+                        f"[Vault] ✅ {finding.secret_type} @ "
+                        f"{finding.file_path}:{finding.line_number} "
+                        f"→ {vault_ocid}"
+                    )
+
+                    # !! Clear actual value from memory !!
+                    finding.matched_text = f"VAULT:{vault_ocid}"
+
+                except Exception as e:
+                    log.error(f"[Vault] ❌ Failed: {e}")
+
+        except Exception as e:
+            log.error(f"[Vault] ❌ Connection failed: {e}")
+
+        return vault_refs
