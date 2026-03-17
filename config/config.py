@@ -24,7 +24,8 @@ OCI_COMPARTMENT_ID = os.getenv("OCI_COMPARTMENT_ID")
 OCI_REGION         = os.getenv("OCI_REGION")
 OCI_VAULT_ID       = os.getenv("OCI_VAULT_ID")
 OCI_VAULT_KEY_ID   = os.getenv("OCI_VAULT_KEY_ID")
-
+OCI_GENAI_ENDPOINT = os.getenv("OCI_GENAI_ENDPOINT")
+OCI_GENAI_MODEL    = os.getenv("OCI_GENAI_MODEL")
 
 # ── Validate all required values are set ───
 def validate():
